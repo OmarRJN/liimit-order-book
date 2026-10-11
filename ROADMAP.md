@@ -13,28 +13,37 @@ Items are intentions, not commitments, and are likely to change as measurements 
 - [x] Mutex-guarded public interface
 - [x] Smoke-test scenario in `main()`
 - [x] Design document (`DESIGN.md`)
+- [x] Validation of zero-quantity orders and modifications
 
 ## Milestone 2: Verification
 
 Goal: be able to state, with evidence, that the engine is correct.
 
+Done, in the plain-assertion harness `tests.cpp`:
+
+- [x] Unit tests covering every case in `TESTING.md` §3
+- [x] Invariant checker, run after every operation in tests (currently by opening up the class with a macro; the proper `CheckInvariants()` hook is still to do)
+- [x] Specify and test zero-quantity and boundary inputs (E1–E3)
+- [x] Randomised differential test against a naive reference model
+- [x] Address, undefined-behaviour and thread sanitiser runs (by hand)
+
+Still to do:
+
 - [ ] Split `Orderbook` into `orderbook.hpp` and a thin `main.cpp`
 - [ ] CMake build with warnings enabled
-- [ ] Catch2 unit tests covering every case in `TESTING.md` §3
-- [ ] `CheckInvariants()` hook, called after every operation in tests
-- [ ] Specify and test zero-quantity and boundary inputs (E1–E3)
-- [ ] Randomised differential test against a naive reference model
-- [ ] Address, undefined-behaviour and thread sanitiser builds
-- [ ] Continuous integration on GCC and Clang
+- [ ] Port the unit tests to Catch2, using `SECTION` blocks for the shared setups
+- [ ] A proper `CheckInvariants()` hook compiled under `ORDERBOOK_TESTING`, replacing the macro
+- [ ] Extend the differential test beyond two million operations, and the concurrency test to check live-order counts
+- [ ] Continuous integration on GCC and Clang, running the sanitiser builds
 
-This milestone is the most valuable on the list. The project's stated aim is correctness in the details, and this is where that aim is demonstrated rather than asserted.
+This milestone is the most valuable on the list. The project's stated aim is correctness in the details, and this is where that aim is demonstrated rather than asserted. The checking itself is now largely done; what remains is making it repeatable by anyone, and automatic.
 
 ## Milestone 3: Semantics
 
 Goal: close the behavioural gaps recorded in `DESIGN.md` §7.
 
 - [ ] Record a single execution price per trade (the resting order's price) in place of each side's limit price
-- [ ] Widen level-quantity accumulation to 64 bits
+- [x] Widen level-quantity accumulation to 64 bits
 - [ ] `GoodForDay` orders, with a session-end cut-off. This is mostly a design question: it needs a clock abstraction so that expiry can be tested without waiting
 - [ ] Reject invalid orders explicitly, returning a status instead of an empty trade list. At present, "rejected" and "accepted but did not trade" are indistinguishable to the caller
 

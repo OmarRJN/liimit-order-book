@@ -65,8 +65,9 @@ Relative to the reference, the additions are:
 1. `FillOrKill` and `Market` order types, including the liquidity check that `FillOrKill` requires.
 2. A mutex-guarded public interface in which composite operations (modify) cannot lock recursively.
 3. `BestBid`, `BestAsk` and a snapshot of aggregated depth, returned by value.
-4. A set of defects fixed during the first pass; these are listed in section 8 because they illustrate the failure modes of this kind of code.
-5. A written invariant set and test plan, in [TESTING.md](TESTING.md).
+4. A set of defects fixed during the first pass and a later review; these are listed in section 8 because they illustrate the failure modes of this kind of code.
+5. A written invariant set and test plan, in [TESTING.md](TESTING.md), with a harness (`tests.cpp`) that implements them.
+6. Validation at the boundary: zero-quantity orders and zero-quantity modifications are refused (section 5.5).
 
 ## 4. Architecture
 
@@ -96,7 +97,7 @@ Three properties of this layout carry most of the design:
 
 ### 4.2 Types
 
-Prices are signed 32-bit integers measured in ticks, not floating-point numbers. Floating-point prices make equality comparison unreliable, and equality is exactly what a matching engine depends on. Quantities are unsigned 32-bit, with `Order::Fill` throwing if asked to fill more than remains, so that an unsigned underflow cannot pass unnoticed. Order identifiers are unsigned 64-bit.
+Prices are signed 32-bit integers measured in ticks, not floating-point numbers. Floating-point prices make equality comparison unreliable, and equality is exactly what a matching engine depends on. The quantity of a single order is unsigned 32-bit, with `Order::Fill` throwing if asked to fill more than remains, so that an unsigned underflow cannot pass unnoticed. Anything that *adds* quantities together (a level's total, or the liquidity a fill-or-kill order needs) uses a separate 64-bit `TotalQuantity`, so two maximal orders at the same price cannot wrap the sum. Order identifiers are unsigned 64-bit.
 
 `Market` orders have no price. They carry a sentinel (`InvalidPrice`) until the book assigns one on entry.
 
@@ -136,13 +137,15 @@ Because bids and asks are matched at the front of their queues, the older order 
 | `FillOrKill` | Rejected unless the full quantity is available at its limit price or better | Not applicable: it fills completely or not at all |
 | `Market` | Priced at the worst opposing level, so it can sweep the book; rejected if the opposite side is empty | Cancelled (it is converted to `FillAndKill`) |
 
-A fill-and-kill order that partially matches will, by construction, be the front order of the best level on its side once matching stops. The cleanup step therefore only inspects the front of each best level, rather than scanning the book.
+A fill-and-kill order that partially matches will, by construction, be the front order of the best level on its side once matching stops. The cleanup step therefore only inspects the front of each best level, rather than scanning the book. The reasoning is that a crossing order can only exist because nothing at or beyond its own price remains on its own side, so it must have become the best level. That is the sort of argument that is easy to get subtly wrong, so it is also checked empirically: the randomised test in [TESTING.md](TESTING.md) §4 compares the engine against a model that removes every fill-and-kill remainder wherever it sits, and has shown no divergence.
 
 ### 5.3 Modification
 
 A modification cancels the existing order and adds a replacement with the same identifier and order type. The replacement joins the back of its queue, so the order **loses time priority**. This mirrors the behaviour of many real venues, where changing price or increasing size forfeits queue position. The reason to prefer it is fairness: allowing a modification to keep its place would let participants enlarge a position without queuing again.
 
 The cost of the choice is that a modification is not atomic with respect to the market. Because the whole operation takes the book's lock, no other thread observes the intermediate state.
+
+A modification to a quantity of zero is refused before anything is cancelled, and the original order stays exactly as it was. The alternative, treating it as a cancel, would let a malformed request silently delete an order. A caller who wants to cancel should say so.
 
 ### 5.4 Invariants
 
@@ -154,6 +157,12 @@ These must hold between any two public operations. They are the basis of the che
 4. **Quantity conservation.** For every order, filled + remaining = initial, and no resting order has zero remaining quantity.
 5. **Unique identifiers.** No two live orders share an `OrderId`.
 
+### 5.5 Validation
+
+An order is refused, with no effect on the book, if its pointer is null, if its quantity is zero, or if its identifier is already live. The check happens before the order is touched, so a rejected market order is never converted to a limit order. A zero-quantity order is refused because it has no sensible meaning: left to rest it would break invariant 4, and left to match it would report a trade of zero lots.
+
+Rejection is currently silent: the caller receives an empty list of trades, which is also what an accepted order that did not trade looks like. Returning a status is planned (see the [roadmap](ROADMAP.md)).
+
 ## 6. Design decisions and trade-offs
 
 **Ordered map rather than a flat array.** A map handles an unbounded, sparse price range with no configuration, at the cost of pointer chasing. For a learning project whose goal is correctness, that is the right default. If benchmarking showed level lookup to be the bottleneck, a bounded array indexed by tick would be the first replacement to try.
@@ -164,19 +173,22 @@ These must hold between any two public operations. They are the basis of the che
 
 **One coarse mutex.** Matching is inherently sequential, because each fill depends on the state left by the previous one. Finer-grained locking would add complexity without enabling real parallelism. Many production engines go further and run the book on a single thread fed by a sequenced queue, which removes locking from the hot path entirely. A mutex is the honest, simple choice at this stage.
 
-**On-demand level sums.** `FillOrKill` pre-checks and depth snapshots currently sum each level's orders when asked. Maintaining a running total per level makes both cheap, at the cost of keeping that total consistent through every add, cancel and fill. It is a good optimisation, but only after the tests described in [TESTING.md](TESTING.md) exist to catch an inconsistency.
+**On-demand level sums.** `FillOrKill` pre-checks and depth snapshots currently sum each level's orders when asked. Maintaining a running total per level makes both cheap, at the cost of keeping that total consistent through every add, cancel and fill. It is a good optimisation, but only after the tests described in [TESTING.md](TESTING.md) are packaged and running automatically, because an inconsistent running total is exactly the kind of fault a randomised comparison finds and a human reviewer does not.
 
 ## 7. Known limitations
 
 - **Execution price reporting.** Each side of a `Trade` records its own limit price. For a market order converted to a limit at the worst opposing price, the reported price is therefore the sweep limit, not the price at which it executed. Recording a single execution price (conventionally that of the resting order) would be more useful to a consumer and is on the roadmap.
-- **Quantity overflow.** A level's aggregated quantity is a 32-bit sum, which could overflow with extreme volumes. A 64-bit accumulator would remove the risk.
 - **Memory.** Orders are heap-allocated individually; there is no pooling.
 - **No time-based expiry.** There is no `GoodForDay` order type or session handling.
 - **Single instrument.** One `Orderbook` object represents one market.
 
-## 8. Defects found during the first pass
+## 8. Defects found and fixed
 
-The initial version of the code did not compile, and beneath the syntax errors were several logic faults. They are recorded here because they are representative of the mistakes this kind of code invites.
+These are recorded because they are representative of the mistakes this kind of code invites. The first table comes from the initial pass; the second from a later review that compiled and tested the finished code.
+
+### 8.1 First pass
+
+The initial version of the code did not compile, and beneath the syntax errors were several logic faults.
 
 | Defect | Consequence | Fix |
 |---|---|---|
@@ -187,6 +199,19 @@ The initial version of the code did not compile, and beneath the syntax errors w
 | `AddOrder` returned from inside its own duplicate check, leaving the rest unreachable | Orders never inserted | Restructured control flow |
 | Constructor and call-site argument orders disagreed (`OrderModify`, `Order`) | Wrong fields populated | Aligned signatures |
 
+### 8.2 Second pass
+
+A later review built the project from scratch and exercised it with the harness in `tests.cpp`. It found two faults in the engine and several in the packaging.
+
+| Defect | Consequence | Fix |
+|---|---|---|
+| A second, unfinished `main()` was left at the end of the source file, using types that did not exist | The file did not compile with any compiler | Removed |
+| Zero-quantity orders were accepted | They rested with nothing remaining (breaking invariant 4) and later produced trades of zero lots | Rejected at the boundary; zero-quantity modifications also refused before any cancel (5.5) |
+| Level totals and the fill-or-kill liquidity sum were 32-bit | Two large orders at one price could wrap the total, giving wrong depth and a wrong fill-or-kill decision | A 64-bit `TotalQuantity` for every sum |
+| The Visual Studio project listed four source files that were not in the repository | The project could not build | Project now lists the single real source file |
+| The documentation called the source `orderbook.cpp` while the project shipped it as `main.cpp` | Build instructions did not match the files | One name, `orderbook.cpp`, throughout |
+
+The zero-quantity case had been flagged in the testing plan as an undecided behaviour (E1). Writing the test is what forced the decision, which is the argument for writing such tests early.
 ## 9. Further reading
 
 - Prior art repositories linked in section 3.

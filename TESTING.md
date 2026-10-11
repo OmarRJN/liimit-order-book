@@ -4,7 +4,9 @@ A matching engine is a good candidate for rigorous testing. Its rules are precis
 
 ## 1. Current state
 
-`main()` in `orderbook.cpp` runs a short scenario with nine checks. It exits with a non-zero status on the first failure.
+There are two layers in place today.
+
+**The demonstration.** `main()` in `orderbook.cpp` runs a short scenario with eleven checks and exits with a non-zero status on the first failure.
 
 | Check | Behaviour covered |
 |---|---|
@@ -15,10 +17,23 @@ A matching engine is a good candidate for rigorous testing. Its rules are precis
 | Market order fills for 5 | A market order sweeps available liquidity |
 | Market remainder does not rest | The unfilled part of a market order is cancelled |
 | Fill-or-kill rejected | A `FillOrKill` with no liquidity leaves the book untouched |
+| Zero-quantity order rejected | Boundary validation on add |
+| Zero-quantity modify ignored | A bad modification does not delete the original order |
 | Order repriced to 99 | `ModifyOrder` replaces an order |
 | Book empty after cancel | `CancelOrder` removes the order and its level |
 
-This is a smoke test. It demonstrates that the main paths work, but it does not establish correctness: it has no negative cases for most operations, it does not check the invariants in `DESIGN.md` §5.4, and a single scenario cannot explore interactions between operations.
+This is a smoke test. It shows that the main paths work; it does not establish correctness.
+
+**The harness.** `tests.cpp` is a separate program that includes the engine and checks it far harder. It contains:
+
+- a unit test for every row of the catalogue in section 3, plus the README usage example verbatim, so the documentation cannot drift from the code;
+- the invariant checker described in section 2.2, run after every unit test and after every randomised operation;
+- the randomised differential test of section 4: 40 fixed seeds of 50,000 operations each, two million in total;
+- a four-thread concurrency test.
+
+At present the harness passes under GCC 13 and Clang 18, and is clean under AddressSanitizer, UndefinedBehaviorSanitizer and ThreadSanitizer. To confirm that it is able to fail, it was also run against five deliberately broken copies of the engine (zero-quantity orders allowed, modify cancelling before validating, a 32-bit liquidity sum, the fill-and-kill cleanup removed, and the wrong end of a queue popped). Each was caught.
+
+**What is still missing** is the packaging rather than the checking. The harness uses plain assertions instead of Catch2, there is no CMake build, and nothing runs in continuous integration, so a regression is found only if someone remembers to run it. The threaded test is a consistency check, not a proof that races are absent: the thread sanitiser reporting nothing is evidence, not a guarantee.
 
 ## 2. Test strategy
 
@@ -37,7 +52,7 @@ Performance measurement is deliberately separate; see §5.
 
 ### 2.2 Invariant helper
 
-Test code needs read access to the internal state to verify the invariants. Rather than make members public, add a `friend` test hook or a `CheckInvariants()` method compiled only when `ORDERBOOK_TESTING` is defined. It should assert:
+Test code needs read access to the internal state to verify the invariants. The recommended approach is a `friend` test hook, or a `CheckInvariants()` method compiled only when `ORDERBOOK_TESTING` is defined. The current harness takes a shortcut instead: it redefines `private` as `public` for the duration of the include. That is acceptable only in a test file, and Clang's pedantic mode rightly warns about it. The proper hook becomes worthwhile when the engine moves into its own header (Milestone 2). Either way, the checker asserts:
 
 1. best bid < best ask whenever both sides are non-empty;
 2. no price level is empty;
@@ -45,11 +60,11 @@ Test code needs read access to the internal state to verify the invariants. Rath
 4. `filled + remaining == initial` for each order, and no resting order has zero remaining quantity;
 5. no identifier appears twice.
 
-Every test below should call this helper after each operation, so that invariants are checked everywhere rather than in one dedicated test.
+Every test below calls this helper after each operation, so that invariants are checked everywhere rather than in one dedicated test.
 
 ## 3. Unit test catalogue
 
-Each row states the setup, the action and the expected outcome. Quantities and prices are illustrative.
+Each row states the setup, the action and the expected outcome. Quantities and prices are illustrative. Every row has a corresponding test in `tests.cpp`, labelled with its ID.
 
 ### 3.1 Matching
 
@@ -107,51 +122,55 @@ Each row states the setup, the action and the expected outcome. Quantities and p
 | D1 | Modify an unknown identifier | No trades; book unchanged |
 | D2 | Modify to a price that crosses | Trades are produced |
 | D3 | Modify a front-of-queue order without changing price | Order moves to the back (priority lost) |
-| D4 | Modify a `FillAndKill`-typed order | Type is preserved |
+| D4 | Modify the identifier of a `FillAndKill` order | A fill-and-kill order never rests, so its identifier is unknown afterwards and the modify does nothing. (The rule that a modification preserves the order type is therefore observable only for `GoodTillCancel` orders, the only type that rests.) |
 
 ### 3.7 Edge cases
 
 | ID | Scenario | Expected |
 |---|---|---|
-| E1 | Zero-quantity order | Decision required: reject at the boundary. *Currently unhandled; to be specified and tested.* |
-| E2 | Maximum price and quantity values | No overflow in matching or depth sums |
+| E1 | Zero-quantity order, or modification to zero | Rejected at the boundary; the book is unchanged, and a modify leaves the original order untouched. *Decided and tested.* |
+| E2 | Maximum price and quantity values | No overflow in matching, depth sums or the fill-or-kill check |
 | E3 | Negative prices | Handled consistently, since `Price` is signed |
 
-E1 and E3 expose underspecified behaviour rather than confirmed bugs. Writing the test forces a decision, which is its main value here.
+E1 began life as an unspecified behaviour. When the harness was first run it confirmed a genuine defect: a zero-quantity order rested on the book with nothing remaining, and a later crossing order produced a trade of zero lots. The decision to reject is recorded in `DESIGN.md` §5.5. E2 exposed the 32-bit level sum, since fixed with a 64-bit `TotalQuantity`. E3 needed no change. In each case the main value of the test was that it forced a decision.
 
 ## 4. Randomised differential testing
 
-Example-based tests encode the cases one thought of. A randomised test finds the ones one did not.
+Example-based tests encode the cases one thought of. A randomised test finds the ones one did not. This layer is implemented in `tests.cpp`.
 
 **Reference model.** A naive implementation that stores all resting orders in a single `std::vector`, and on each operation finds matches by sorting by price, then arrival sequence. It is slow and obviously correct, which is the point.
 
 **Procedure.**
 
-1. Generate a seeded random stream of operations: add (random side, type, price within a narrow band, small quantity), cancel (an existing or non-existing identifier), modify.
+1. Generate a seeded random stream of operations: add (random side, type, price within a narrow band, small quantity including zero), cancel (an existing or non-existing identifier), modify.
 2. Apply each operation to both the real book and the model.
 3. After every operation, compare the returned trades (identifiers, prices, quantities, order) and the full depth snapshot.
 4. Run the invariant helper on the real book.
 
-A narrow price band and small quantities are important: they force frequent crossing, multi-level sweeps and partial fills, which is where the faults concentrate. On failure, print the seed and the operation index so that the case can be replayed and shrunk by hand.
+A narrow price band, a small identifier range and small quantities are important: they force frequent crossing, multi-level sweeps, partial fills, duplicate identifiers and cancels of unknown orders, which is where the faults concentrate. On failure, the seed and operation index are printed so that the case can be replayed and shrunk by hand.
+
+One limit of this method deserves stating. The model was written by the same person as the engine, so a misunderstanding of the rules would be copied into both and go unnoticed. The unit tests in section 3, which encode the rules independently as concrete examples, are the guard against that.
 
 ## 5. Sanitisers and performance
 
-**Sanitisers.** Build the test binary three ways:
+**Sanitisers.** Build the test binary two ways (address and thread sanitisers cannot be combined):
 
 ```
 -fsanitize=address,undefined      # memory errors, iterator misuse, signed overflow
 -fsanitize=thread                 # data races (needs a multi-threaded test, below)
 ```
 
+Both are clean at present.
+
 The map-node reference bug described in `DESIGN.md` §8 is exactly the kind of fault AddressSanitizer exists to catch.
 
-**Concurrency test.** Several threads add and cancel concurrently against one book; afterwards, run the invariant helper and check that the number of live orders equals adds minus cancels minus fully filled orders. This tests that the lock discipline holds, not that results are deterministic.
+**Concurrency test.** Several threads add and cancel concurrently against one book; afterwards, run the invariant helper. This tests that the lock discipline holds, not that results are deterministic. The current test runs four threads of 20,000 operations each and checks the invariants only. The stricter check originally planned here, that the number of live orders equals adds minus cancels minus fully filled orders, is not yet implemented.
 
 **Benchmarks.** Kept apart from correctness tests so a slow machine never produces a spurious failure. Measure add, cancel and match throughput over a seeded synthetic workload, and report medians over repeated runs rather than a single figure. Compile with optimisation, pin the benchmark to a core where possible, and record the compiler version and hardware beside the results. A number without its conditions cannot be interpreted.
 
 ## 6. Build integration
 
-A minimal `CMakeLists.txt` target, once the header split has been made:
+Not yet done. A minimal `CMakeLists.txt` target, once the header split has been made:
 
 ```cmake
 cmake_minimum_required(VERSION 3.20)
@@ -170,13 +189,16 @@ enable_testing()
 add_test(NAME orderbook_tests COMMAND orderbook_tests)
 ```
 
-Continuous integration (GitHub Actions) should build with both GCC and Clang and run this target on every push.
+Continuous integration (GitHub Actions) should build with both GCC and Clang and run this target on every push. Today the commands in the header comment of `tests.cpp` are run by hand.
 
 ## 7. Definition of done for the core
 
 The core is considered tested when:
 
-- every row in §3 has a passing test;
-- the invariant helper runs after every operation in every test;
-- the differential test has run for at least several million random operations without divergence across multiple seeds;
-- the suite passes under address, undefined-behaviour and thread sanitisers.
+- every row in §3 has a passing test (**met**);
+- the invariant helper runs after every operation in every test (**met**);
+- the differential test has run for at least several million random operations without divergence across multiple seeds (**partly met**: two million operations over 40 seeds so far);
+- the suite passes under address, undefined-behaviour and thread sanitisers (**met**);
+- the suite is built by CMake and run automatically on every push (**not met**).
+
+The last item is why the README still treats the engine as tested rather than finished: the evidence exists, but it has to be re-run by hand.
